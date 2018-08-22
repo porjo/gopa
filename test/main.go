@@ -1,8 +1,11 @@
 package main
 
 import (
-	"fmt"
+	"bytes"
+	"encoding/binary"
+	//"fmt"
 	"log"
+	"os"
 
 	"github.com/mesilliac/pulse-simple"
 	"gopkg.in/hraban/opus.v2"
@@ -11,49 +14,106 @@ import (
 const sampleRate = 48000
 const channels = 1 // mono; 2 for stereo
 const bufferSize = 1000
-const opusFrameSize = 20 // msec
+const frameSizeMs = 60 // msec
+
+var l *log.Logger = log.New(os.Stderr, "", log.LstdFlags)
 
 func main() {
 
 	ss := pulse.SampleSpec{pulse.SAMPLE_S16LE, sampleRate, channels}
 	stream, err := pulse.Capture("my app", "my stream", &ss)
 	if err != nil {
-		log.Fatal(err)
+		l.Fatal(err)
 	}
 
 	var n, n2 int
-	pcmBuf := make([]byte, ss.UsecToBytes(opusFrameSize*1000))
+	pcmBuf := make([]byte, ss.UsecToBytes(frameSizeMs*1000))
 	opusBuf := make([]byte, bufferSize)
+
+	bufChan := make(chan []byte)
+	go Decoder(bufChan)
+
 	for {
 		n, err = stream.Read(pcmBuf)
 		if err != nil {
-			log.Fatalf("Couldn't read from pulse stream: %s\n", err)
+			l.Fatalf("Couldn't read from pulse stream: %s\n", err)
 		}
 
-		fmt.Printf("pulse: read %d bytes, bytes %x\n", n, pcmBuf)
+		//fmt.Printf("pulse: read %d bytes, bytes %x\n", n, pcmBuf)
 
-		// https://github.com/hraban/opus/blob/v2/stream_test.go#L81
-		numSamples := n / 2
-		pcm := make([]int16, numSamples)
-		for i := 0; i < numSamples; i++ {
-			pcm[i] += int16(pcmBuf[i*2])
-			pcm[i] += int16(pcmBuf[i*2+1]) << 8
+		pcm := make([]int16, n/2)
+
+		buf := bytes.NewReader(pcmBuf)
+		err := binary.Read(buf, binary.LittleEndian, &pcm)
+		if err != nil {
+			l.Fatal("binary.Read failed:", err)
 		}
 
-		fmt.Printf("pcm int16: %d\n", pcm)
+		//fmt.Printf("pcm int16: %d\n", pcm)
 
 		enc, err := opus.NewEncoder(sampleRate, channels, opus.AppVoIP)
 		if err != nil {
-			log.Fatalf("opus encoder error: %s\n", err)
+			l.Fatalf("opus encoder error: %s\n", err)
 		}
 		n2, err = enc.Encode(pcm, opusBuf)
 		if err != nil {
-			log.Fatal("opus encode error: ", err)
+			l.Fatal("opus encode error: ", err)
 		}
-		opusBuf = opusBuf[:n2] // only the first N bytes are opus data. Just like io.Reader.
 
-		fmt.Printf("opus enc: read %d bytes\n", n2)
+		select {
+		case bufChan <- opusBuf[:n2]:
+		default:
+			l.Printf("decoder was not ready, missed %d bytes\n", n2)
+		}
+	}
+}
+
+func Decoder(in chan []byte) {
+	dec, err := opus.NewDecoder(sampleRate, channels)
+	if err != nil {
+		l.Fatalf("opus decoder error: %s\n", err)
+	}
+
+	pcmChan := make(chan []int16, 100)
+	go Writer(pcmChan)
+
+	frameSize := channels * frameSizeMs * sampleRate / 1000
+	pcm2 := make([]int16, int(frameSize))
+
+	var n int
+	for {
+		buf := <-in
+		n, err = dec.Decode(buf, pcm2)
+		if err != nil {
+			l.Fatal("opus decode error: ", err)
+		}
+
+		select {
+		case pcmChan <- pcm2[:n]:
+		default:
+			l.Printf("writer was not ready, missed %d samples\n", n)
+		}
 
 	}
 
+}
+
+func Writer(in chan []int16) {
+
+	ss := pulse.SampleSpec{pulse.SAMPLE_S16LE, sampleRate, channels}
+	stream, err := pulse.Playback("my app2", "my stream2", &ss)
+	if err != nil {
+		l.Fatal(err)
+	}
+	defer stream.Free()
+	defer stream.Drain()
+	//buf := new(bytes.Buffer)
+	for {
+		pcm := <-in
+
+		err = binary.Write(stream, binary.LittleEndian, pcm)
+		if err != nil {
+			l.Fatal("binary.Write error: ", err)
+		}
+	}
 }
