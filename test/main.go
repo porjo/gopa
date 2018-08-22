@@ -1,8 +1,6 @@
 package main
 
 import (
-	//"bytes"
-	//	"encoding/binary"
 	"fmt"
 	"log"
 
@@ -13,6 +11,7 @@ import (
 const sampleRate = 48000
 const channels = 1 // mono; 2 for stereo
 const bufferSize = 1000
+const opusFrameSize = 20 // msec
 
 func main() {
 
@@ -23,32 +22,15 @@ func main() {
 	}
 
 	var n, n2 int
-	pcmBuf := make([]byte, bufferSize)
+	pcmBuf := make([]byte, ss.UsecToBytes(opusFrameSize*1000))
 	opusBuf := make([]byte, bufferSize)
 	for {
 		n, err = stream.Read(pcmBuf)
 		if err != nil {
-			log.Fatalf("Couldn't read from fifo: %s\n", err)
+			log.Fatalf("Couldn't read from pulse stream: %s\n", err)
 		}
 
-		fmt.Printf("pulse: read %d bytes, bytes %x\n", n, pcmBuf[:8])
-
-		enc, err := opus.NewEncoder(sampleRate, channels, opus.AppVoIP)
-		if err != nil {
-			log.Fatalf("opus encoder error: %s\n", err)
-		}
-
-		/*
-			// Check the frame size. You don't need to do this if you trust your input.
-			frameSize := len(b) // must be interleaved if stereo
-			frameSizeMs := float32(frameSize) / channels * 1000 / sampleRate
-			switch frameSizeMs {
-			case 2.5, 5, 10, 20, 40, 60:
-				// Good.
-			default:
-				return fmt.Errorf("Illegal frame size: %d bytes (%f ms)", frameSize, frameSizeMs)
-			}
-		*/
+		fmt.Printf("pulse: read %d bytes, bytes %x\n", n, pcmBuf)
 
 		// https://github.com/hraban/opus/blob/v2/stream_test.go#L81
 		numSamples := n / 2
@@ -58,8 +40,12 @@ func main() {
 			pcm[i] += int16(pcmBuf[i*2+1]) << 8
 		}
 
-		fmt.Printf("pcm int16: %d\n", pcm[:4])
+		fmt.Printf("pcm int16: %d\n", pcm)
 
+		enc, err := opus.NewEncoder(sampleRate, channels, opus.AppVoIP)
+		if err != nil {
+			log.Fatalf("opus encoder error: %s\n", err)
+		}
 		n2, err = enc.Encode(pcm, opusBuf)
 		if err != nil {
 			log.Fatal("opus encode error: ", err)
