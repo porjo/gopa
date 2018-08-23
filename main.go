@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -11,6 +14,8 @@ import (
 	"time"
 
 	"github.com/mesilliac/pulse-simple"
+	"github.com/pions/webrtc"
+	"github.com/pions/webrtc/pkg/ice"
 	"gopkg.in/hraban/opus.v2"
 )
 
@@ -33,8 +38,14 @@ var stats Stats = Stats{}
 
 func main() {
 
+	reader := bufio.NewReader(os.Stdin)
+	rawSd, err := reader.ReadString('\n')
+	if err != nil && err != io.EOF {
+		l.Fatal(err)
+	}
+
 	// enable echo-cancellation (this didn't seem to make any difference for me!?)
-	err := os.Setenv("PULSE_PROP", "filter.want=echo-cancel")
+	err = os.Setenv("PULSE_PROP", "filter.want=echo-cancel")
 	if err != nil {
 		l.Fatal(err)
 	}
@@ -67,9 +78,11 @@ func main() {
 	pcmBuf := make([]byte, ss.UsecToBytes(frameSizeMs*1000))
 
 	dataChan := make(chan []int16)
+	rtcChan := make(chan webrtc.RTCSample)
 
-	wg.Add(1)
-	go EncDecPlay(dataChan, quitChan)
+	wg.Add(2)
+	go Encode(dataChan, rtcChan, quitChan)
+	go WebRTCPipe(rtcChan, quitChan, rawSd)
 
 main:
 	for {
@@ -95,41 +108,27 @@ main:
 			break main
 		case dataChan <- pcm:
 		default:
-			fmt.Printf("EncDec not ready, dropped %d samples\n", len(pcm))
+			fmt.Printf("Encode not ready, dropped %d samples\n", len(pcm))
 		}
 	}
 
 	wg.Wait()
 }
 
-// EncDecPlay handles encoding PCM to Opus,
-// decoding Opus to PCM, and playing back PCM
-// this runs from a separate goroutine to keep the audio capture routine as tight as possible
-func EncDecPlay(dataChan chan []int16, quitChan chan struct{}) {
-	wg.Done()
-	ss := pulse.SampleSpec{pulse.SAMPLE_S16LE, sampleRate, channels}
-	ba2 := pulse.NewBufferAttr()
-	ba2.Tlength = uint32(ss.UsecToBytes(frameSizeMs * 1000))
-	stream2, err := pulse.NewStream("", "my app2", pulse.STREAM_PLAYBACK, "", "my stream2", &ss, nil, ba2)
-	if err != nil {
-		l.Fatal(err)
-	}
-	lat2, _ := stream2.Latency()
-	fmt.Printf("playback latency %s\n", time.Duration(lat2*1000))
-	defer stream2.Free()
-	defer stream2.Drain()
+func Encode(inChan chan []int16, outChan chan webrtc.RTCSample, quitChan chan struct{}) {
+	defer wg.Done()
 
 	var n int
 	var pcm []int16
 	frameSize := channels * frameSizeMs * sampleRate / 1000
-	pcm2 := make([]int16, int(frameSize))
 	opusBuf := make([]byte, bufferSize)
 
 	for {
 		select {
 		case <-quitChan:
+			fmt.Println("quiting Opus Encode")
 			return
-		case pcm = <-dataChan:
+		case pcm = <-inChan:
 		}
 
 		enc, err := opus.NewEncoder(sampleRate, channels, opus.AppVoIP)
@@ -146,29 +145,91 @@ func EncDecPlay(dataChan chan []int16, quitChan chan struct{}) {
 		stats.TotalOpus += uint64(n)
 		stats.Unlock()
 
-		// decode Opus to PCM
-		dec, err := opus.NewDecoder(sampleRate, channels)
-		if err != nil {
-			l.Fatal("opus decoder error: ", err)
+		rtcSample := webrtc.RTCSample{Data: opusBuf, Samples: uint32(frameSize)}
+		select {
+		case outChan <- rtcSample:
+		default:
+			fmt.Printf("WebRTC not ready, dropped %d samples\n", frameSize)
 		}
 
-		n, err = dec.Decode(opusBuf[:n], pcm2)
-		if err != nil {
-			l.Fatal("opus decode error: ", err)
-		}
+		/*
+			if time.Now().Sub(stats.Last) > 2*time.Second {
+				fmt.Printf("total pcm %d, total opus %d, %.2f%% data saved\n", stats.TotalPcm, stats.TotalOpus, 100-float64(stats.TotalOpus)/float64(stats.TotalPcm)*100)
+				stats.Last = time.Now()
+			}
+			stats.Unlock()
+		*/
+	}
+}
 
-		// playback PCM via Pulseaudio playback stream
-		err = binary.Write(stream2, binary.LittleEndian, pcm2)
-		if err != nil {
-			l.Fatal("binary.Write error: ", err)
-		}
+func WebRTCPipe(inChan chan webrtc.RTCSample, quitChan chan struct{}, rawSd string) {
+	defer wg.Done()
 
-		stats.Lock()
-		if time.Now().Sub(stats.Last) > 2*time.Second {
-			fmt.Printf("total pcm %d, total opus %d, %.2f%% data saved\n", stats.TotalPcm, stats.TotalOpus, 100-float64(stats.TotalOpus)/float64(stats.TotalPcm)*100)
-			stats.Last = time.Now()
-		}
-		stats.Unlock()
+	fmt.Println("")
+	sd, err := base64.StdEncoding.DecodeString(rawSd)
+	if err != nil {
+		panic(err)
+	}
 
+	/* Everything below is the pion-WebRTC API, thanks for using it! */
+
+	// Setup the codecs you want to use.
+	// We'll use the default ones but you can also define your own
+	webrtc.RegisterDefaultCodecs()
+
+	// Create a new RTCPeerConnection
+	peerConnection, err := webrtc.New(webrtc.RTCConfiguration{
+		ICEServers: []webrtc.RTCICEServer{
+			{
+				URLs: []string{"stun:stun.l.google.com:19302"},
+			},
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	// Set the handler for ICE connection state
+	// This will notify you when the peer has connected/disconnected
+	peerConnection.OnICEConnectionStateChange = func(connectionState ice.ConnectionState) {
+		fmt.Printf("Connection State has changed %s \n", connectionState.String())
+	}
+
+	// Create a audio track
+	opusTrack, err := peerConnection.NewRTCTrack(webrtc.DefaultPayloadTypeOpus, "audio", "pion1")
+	if err != nil {
+		panic(err)
+	}
+	_, err = peerConnection.AddTrack(opusTrack)
+	if err != nil {
+		panic(err)
+	}
+
+	// Set the remote SessionDescription
+	offer := webrtc.RTCSessionDescription{
+		Type: webrtc.RTCSdpTypeOffer,
+		Sdp:  string(sd),
+	}
+	if err := peerConnection.SetRemoteDescription(offer); err != nil {
+		panic(err)
+	}
+
+	// Sets the LocalDescription, and starts our UDP listeners
+	answer, err := peerConnection.CreateAnswer(nil)
+	if err != nil {
+		panic(err)
+	}
+
+	// Get the LocalDescription and take it to base64 so we can paste in browser
+	fmt.Println(base64.StdEncoding.EncodeToString([]byte(answer.Sdp)))
+
+	for {
+		select {
+		case <-quitChan:
+			fmt.Println("quiting WebRTC pipe")
+			return
+		case s := <-inChan:
+			opusTrack.Samples <- s
+		}
 	}
 }
