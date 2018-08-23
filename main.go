@@ -18,7 +18,6 @@ const sampleRate = 48000
 const channels = 1 // mono; 2 for stereo
 const bufferSize = 1000
 const frameSizeMs = 60 // 2.5, 5, 10, 20, 40, 60
-const frameSize = channels * frameSizeMs * sampleRate / 1000
 
 var l *log.Logger = log.New(os.Stderr, "", log.LstdFlags)
 var wg sync.WaitGroup
@@ -34,6 +33,7 @@ var stats Stats = Stats{}
 
 func main() {
 
+	// enable echo-cancellation (this didn't seem to make any difference for me!?)
 	err := os.Setenv("PULSE_PROP", "filter.want=echo-cancel")
 	if err != nil {
 		l.Fatal(err)
@@ -69,18 +69,15 @@ func main() {
 	dataChan := make(chan []int16)
 
 	wg.Add(1)
-	go EncDec(dataChan, quitChan)
+	go EncDecPlay(dataChan, quitChan)
 
 main:
 	for {
+		// read from the Pulseaudio record stream
 		n, err = stream1.Read(pcmBuf)
 		if err != nil {
 			l.Fatal("Couldn't read from pulse stream: ", err)
 		}
-
-		stats.Lock()
-		stats.TotalPcm += uint64(n)
-		stats.Unlock()
 
 		pcm := make([]int16, n/2)
 		buf := bytes.NewReader(pcmBuf[:n])
@@ -88,6 +85,10 @@ main:
 		if err != nil {
 			l.Fatal("binary.Read failed:", err)
 		}
+
+		stats.Lock()
+		stats.TotalPcm += uint64(n)
+		stats.Unlock()
 
 		select {
 		case <-quitChan:
@@ -101,7 +102,10 @@ main:
 	wg.Wait()
 }
 
-func EncDec(dataChan chan []int16, quitChan chan struct{}) {
+// EncDecPlay handles encoding PCM to Opus,
+// decoding Opus to PCM, and playing back PCM
+// this runs from a separate goroutine to keep the audio capture routine as tight as possible
+func EncDecPlay(dataChan chan []int16, quitChan chan struct{}) {
 	wg.Done()
 	ss := pulse.SampleSpec{pulse.SAMPLE_S16LE, sampleRate, channels}
 	ba2 := pulse.NewBufferAttr()
@@ -117,6 +121,7 @@ func EncDec(dataChan chan []int16, quitChan chan struct{}) {
 
 	var n int
 	var pcm []int16
+	frameSize := channels * frameSizeMs * sampleRate / 1000
 	pcm2 := make([]int16, int(frameSize))
 	opusBuf := make([]byte, bufferSize)
 
@@ -132,6 +137,7 @@ func EncDec(dataChan chan []int16, quitChan chan struct{}) {
 			l.Fatal("opus encoder error: ", err)
 		}
 
+		// encode PCM to Opus
 		n, err = enc.Encode(pcm, opusBuf)
 		if err != nil {
 			l.Fatal("opus encode error: ", err)
@@ -140,6 +146,7 @@ func EncDec(dataChan chan []int16, quitChan chan struct{}) {
 		stats.TotalOpus += uint64(n)
 		stats.Unlock()
 
+		// decode Opus to PCM
 		dec, err := opus.NewDecoder(sampleRate, channels)
 		if err != nil {
 			l.Fatal("opus decoder error: ", err)
@@ -150,6 +157,7 @@ func EncDec(dataChan chan []int16, quitChan chan struct{}) {
 			l.Fatal("opus decode error: ", err)
 		}
 
+		// playback PCM via Pulseaudio playback stream
 		err = binary.Write(stream2, binary.LittleEndian, pcm2)
 		if err != nil {
 			l.Fatal("binary.Write error: ", err)
