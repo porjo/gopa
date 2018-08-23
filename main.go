@@ -23,7 +23,21 @@ const frameSize = channels * frameSizeMs * sampleRate / 1000
 var l *log.Logger = log.New(os.Stderr, "", log.LstdFlags)
 var wg sync.WaitGroup
 
+type Stats struct {
+	sync.Mutex
+	TotalPcm  uint64
+	TotalOpus uint64
+	Last      time.Time
+}
+
+var stats Stats = Stats{}
+
 func main() {
+
+	err := os.Setenv("PULSE_PROP", "filter.want=echo-cancel")
+	if err != nil {
+		l.Fatal(err)
+	}
 
 	ss := pulse.SampleSpec{pulse.SAMPLE_S16LE, sampleRate, channels}
 	// request desired latency as per:
@@ -63,6 +77,10 @@ main:
 		if err != nil {
 			l.Fatal("Couldn't read from pulse stream: ", err)
 		}
+
+		stats.Lock()
+		stats.TotalPcm += uint64(n)
+		stats.Unlock()
 
 		pcm := make([]int16, n/2)
 		buf := bytes.NewReader(pcmBuf[:n])
@@ -118,6 +136,9 @@ func EncDec(dataChan chan []int16, quitChan chan struct{}) {
 		if err != nil {
 			l.Fatal("opus encode error: ", err)
 		}
+		stats.Lock()
+		stats.TotalOpus += uint64(n)
+		stats.Unlock()
 
 		dec, err := opus.NewDecoder(sampleRate, channels)
 		if err != nil {
@@ -133,5 +154,13 @@ func EncDec(dataChan chan []int16, quitChan chan struct{}) {
 		if err != nil {
 			l.Fatal("binary.Write error: ", err)
 		}
+
+		stats.Lock()
+		if time.Now().Sub(stats.Last) > 2*time.Second {
+			fmt.Printf("total pcm %d, total opus %d, %.2f%% data saved\n", stats.TotalPcm, stats.TotalOpus, 100-float64(stats.TotalOpus)/float64(stats.TotalPcm)*100)
+			stats.Last = time.Now()
+		}
+		stats.Unlock()
+
 	}
 }
